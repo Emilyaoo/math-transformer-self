@@ -35,14 +35,20 @@ def encode_text(text):
 
 def encode_state_text(problem_text, chain_text, step_index=None, carry1=None, carry2=None):
     state_vec = torch.cat([encode_text(problem_text), encode_text(chain_text)])
-    if step_index is not None and carry1 is not None and carry2 is not None:
-        extra_vec = torch.tensor([
-            step_index / 6.0,
-            carry1 / 9.0,
-            carry2 / 9.0
-        ])
-        state_vec = torch.cat([state_vec, extra_vec])
-    return state_vec
+
+    # 加入位置 one-hot 编码（6步以内）
+    position_vec = torch.zeros(6)
+    if step_index is not None and step_index < 6:
+        position_vec[step_index] = 1.0
+
+    # carry1 和 carry2（默认 0）
+    carry_vec = torch.tensor([
+        carry1 / 9.0 if carry1 is not None else 0.0,
+        carry2 / 9.0 if carry2 is not None else 0.0
+    ])
+
+    return torch.cat([state_vec, position_vec, carry_vec])
+
 
 
 
@@ -61,10 +67,10 @@ def encode_state_text(problem_text, chain_text, step_index=None, carry1=None, ca
 #############################################
 
 class TransformerPolicyNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim, d_model=128, nhead=4, num_layers=2):
+    def __init__(self, input_dim, output_dim, d_model=128, nhead=4, num_layers=1):  # 👈 改为1层
         super().__init__()
         self.output_dim = output_dim
-        self.input_proj = nn.Linear(input_dim, d_model)  # 这里已经是 state + action 之后的维度
+        self.input_proj = nn.Linear(input_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_layer = nn.Linear(d_model, 1)
@@ -75,16 +81,16 @@ class TransformerPolicyNetwork(nn.Module):
         return self.output_layer(x.squeeze(0).squeeze(0))
 
 
+
 #############################################
 # RL Agent (Using Transformer)
 #############################################
 
 class RLAgentSimple:
-    def __init__(self, lr=1e-3, state_dim=69, num_actions=7):
+    def __init__(self, lr=1e-3, input_dim=60, num_actions=7):
             self.num_actions = num_actions
-            self.state_dim = state_dim
-            self.input_dim = self.state_dim + self.num_actions  # 拼接后总输入维度
-            self.policy_net = TransformerPolicyNetwork(input_dim=self.input_dim, output_dim=num_actions)
+            self.input_dim = input_dim
+            self.policy_net = TransformerPolicyNetwork(input_dim=input_dim, output_dim=num_actions)
             self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
             self.episode_log_probs = []
             self.loss_terms = []
@@ -95,8 +101,16 @@ class RLAgentSimple:
             action_tensor = torch.zeros(env.num_actions)
             action_tensor[action_index] = 1.0
             input_tensor = torch.cat([state, action_tensor])
-            score = self.policy_net(input_tensor)
+
+            action_text = env.allowed_actions[action_index]
+            # 完全禁止重复动作
+            if action_text in env.chain:
+                score = torch.tensor([-9999.0])
+            else:
+                score = self.policy_net(input_tensor)
+
             action_scores.append(score)
+
         scores_tensor = torch.stack(action_scores).view(-1)
         probs = torch.softmax(scores_tensor, dim=0)
         dist = torch.distributions.Categorical(probs)
@@ -179,69 +193,58 @@ def generate_multiplication_problem_three():
             # The correct procedure as a chain of strings (all lowercase)
             correct_steps = [step1.lower(), step2.lower(), step3.lower(), step4.lower(), step5.lower(), step6.lower()]
             # Allowed actions: the 6 correct ones, plus one extra dummy option to pad to a total of 7.
-            allowed_actions = correct_steps + ["dummy"]
+            allowed_actions = correct_steps  # 不要 dummy
             return problem_text.lower(), allowed_actions, correct_steps, correct_answer, A, M, carry1, carry2
 
 
 class MultiplicationTeacherThree:
-            """
-            Revised Multiplication Teacher.
-            Instead of parsing numbers and performing arithmetic, it only compares
-            the agent’s chain of actions (text strings) with the pre-generated correct chain.
-            This forces the RL agent to learn the full procedure from the text tokens.
-            """
+    def __init__(self, correct_steps, correct_answer, A, M):
+        self.correct_steps = correct_steps
+        self.correct_answer = correct_answer
+        self.A = A
+        self.M = M
 
-            def __init__(self, correct_steps, correct_answer, A, M):
-                self.correct_steps = correct_steps
-                self.correct_answer = correct_answer
-                self.A = A
-                self.M = M
+    def evaluate_solution(self, chain):
+        reward = 0.0
+        feedback_lines = []
 
-            def evaluate_solution(self, chain):
-                reward = 0.0
-                feedback_lines = []
+        stages = ["Ones multiplication", "Tens multiplication", "Hundreds multiplication",
+                  "Output ones digit", "Output tens digit", "Output hundreds digits"]
 
-                stages = ["Ones multiplication", "Tens multiplication", "Hundreds multiplication",
-                          "Output ones digit", "Output tens digit", "Output hundreds digits"]
+        for i, correct_step in enumerate(self.correct_steps):
+            stage = stages[i]
+            if i < len(chain):
+                student_step = chain[i]
 
-                for i, correct_step in enumerate(self.correct_steps):
-                    stage_name = stages[i] if i < len(stages) else f"Step {i + 1}"
-
-                    if i < len(chain):
-                        student_step = chain[i]
-                        if student_step == correct_step:
-                            reward += 8.0  # 正确步骤奖励
-                            feedback_lines.append(f"✔ {stage_name} correct: {student_step}")
-                        elif student_step.split()[0] == correct_step.split()[0]:
-                            reward += 2.0  # 行动类型正确但内容错误
-                            feedback_lines.append(
-                                f"❗ {stage_name} action type correct but wrong details.\nExpected: {correct_step}\nGot: {student_step}")
-                        else:
-                            reward -= 4.0
-                            feedback_lines.append(
-                                f"✘ {stage_name} wrong.\nExpected: {correct_step}\nGot: {student_step}")
-                    else:
-                        reward -= 2.0
-                        feedback_lines.append(f"⚠ Missing {stage_name}. Expected: {correct_step}")
-
-                # 计算顺序奖励
-                correct_order = True
-                for expected, actual in zip(self.correct_steps, chain):
-                    if expected != actual:
-                        correct_order = False
-                        break
-                if correct_order:
-                    reward += 10.0
-                    feedback_lines.append("🌟 All steps in correct order!")
-
-                # 完全正确奖励
-                if chain == self.correct_steps:
-                    reward += 20.0
-                    feedback_lines.append(f"\n🎉 Full solution correct! Product: {self.correct_answer}")
+                if student_step == correct_step:
+                    reward += 10
+                    feedback_lines.append(f"✔ {stage} correct: {student_step}")
+                elif student_step.split(":")[0] == correct_step.split(":")[0]:
+                    reward += 3
+                    feedback_lines.append(f"❗ {stage} action type correct but wrong details.\nExpected: {correct_step}\nGot:      {student_step}")
+                elif student_step.startswith("multiply") and correct_step.startswith("multiply"):
+                    reward += 2
+                    feedback_lines.append(f"❗ {stage} is a multiply step but wrong details.\nExpected: {correct_step}\nGot:      {student_step}")
                 else:
-                    feedback_lines.append("\n❌ Final result: Procedure not fully correct.")
+                    reward -= 4
+                    feedback_lines.append(f"✘ {stage} wrong.\nExpected: {correct_step}\nGot:      {student_step}")
+            else:
+                reward -= 3
+                feedback_lines.append(f"⚠ Missing {stage}. Expected: {correct_step}")
 
-                return "\n".join(feedback_lines), reward
+        # 顺序完全正确
+        if chain[:len(self.correct_steps)] == self.correct_steps:
+            reward += 15
+            feedback_lines.append("🌟 All steps in correct order!")
+
+        # 全部正确
+        if chain == self.correct_steps:
+            reward += 20
+            feedback_lines.append(f"🎉 Full solution correct! Product: {self.correct_answer}")
+        else:
+            feedback_lines.append("❌ Final result: Procedure not fully correct.")
+
+        return "\n".join(feedback_lines), reward
 
 
 class MultiplicationEnvThree:
@@ -284,12 +287,13 @@ class MultiplicationEnvThree:
                 reward = 0.0
                 current_step = len(self.chain) - 1
 
-                # ✅ 主要奖励逻辑：如果当前步骤正确，加正奖励，否则减分
                 if current_step < len(self.correct_steps):
                     if self.chain[current_step] == self.correct_steps[current_step]:
-                        reward += 10.0
+                        reward += 10.0  # 正确匹配
+                    elif self.chain[current_step].split()[0] == self.correct_steps[current_step].split()[0]:
+                        reward += 1.0  # 类型正确但内容错
                     else:
-                        reward -= 5.0
+                        reward -= 5.0  # 完全错
 
                 # ✅ 惩罚重复动作（最多允许重复1次）
                 if self.chain.count(action) > 2:
@@ -324,37 +328,48 @@ class CompositeMathEnv:
 #############################################
 
 def train_agent(num_episodes=5000):
-   env = CompositeMathEnv()
-   state_dim = 2 * vocab_size + 3  # problem + chain + step_index/carry1/carry2
-   num_actions = env.env.num_actions
-   agent = RLAgentSimple(lr=1e-3, state_dim=state_dim, num_actions=num_actions)
-   for episode in range(num_episodes):
-       state = env.reset()
-       done = False
-       total_proc_reward = 0.0
-       while not done:
-           action = agent.choose_action(state, env.env)
-           next_state, reward, done, _ = env.step(action)
-           agent.accumulate_loss(reward)
-           total_proc_reward += reward
-           state = next_state
-       teacher = env.env.teacher
-       # For multiplication, we simply check if the produced chain exactly matches
-       # the expert chain. For addition, the teacher still computes a sum.
-       if env.task == "mul":
-           teacher_feedback, teacher_reward = teacher.evaluate_solution(env.env.chain)
-       else:
-           teacher_feedback, teacher_reward = teacher.evaluate_solution(env.env.chain)
-       total_final_reward = total_proc_reward + teacher_reward
-       agent.finalize_episode(total_final_reward)
-       if (episode + 1) % 100 == 0:
-           computed = teacher.correct_answer if env.env.chain == teacher.correct_steps else "N/A"
-           print(
-               f"Episode {episode + 1} [{env.task}], Proc Reward: {total_proc_reward:.2f}, "
-               f"Teacher Reward: {teacher_reward:.2f}, Computed: {computed}, True: {env.env.correct_answer}"
-           )
+    env = CompositeMathEnv()
+    state = env.reset()
+    num_actions = env.env.num_actions
 
-   return agent
+    # 生成 dummy action tensor，用于确定输入总长度
+    dummy_action_tensor = torch.zeros(num_actions)
+    input_tensor = torch.cat([state, dummy_action_tensor])
+    input_dim = input_tensor.shape[0]
+
+    # 用实际输入维度创建 agent
+    agent = RLAgentSimple(
+        lr=1e-3,
+        input_dim=input_dim,
+        num_actions=num_actions
+    )
+
+    for episode in range(num_episodes):
+        state = env.reset()
+        done = False
+        total_proc_reward = 0.0
+        while not done:
+            action = agent.choose_action(state, env.env)
+            next_state, reward, done, _ = env.step(action)
+            agent.accumulate_loss(reward)
+            total_proc_reward += reward
+            state = next_state
+
+        teacher = env.env.teacher
+        teacher_feedback, teacher_reward = teacher.evaluate_solution(env.env.chain)
+        total_final_reward = total_proc_reward + teacher_reward
+        agent.finalize_episode(total_final_reward)
+
+        if (episode + 1) % 100 == 0:
+            computed = teacher.correct_answer if env.env.chain == teacher.correct_steps else "N/A"
+            print(
+                f"Episode {episode + 1} [{env.task}], Proc Reward: {total_proc_reward:.2f}, "
+                f"Teacher Reward: {teacher_reward:.2f}, Computed: {computed}, True: {env.env.correct_answer}"
+            )
+
+    return agent
+
+
 #############################################
 # Simplified GUI for Multiplication Only
 #############################################
