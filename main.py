@@ -97,14 +97,40 @@ class RLAgentSimple:
 
     def choose_action(self, state, env):
         action_scores = []
+        step_index = len(env.chain)
+
+        # 每一步应该的前缀
+        step_requirements = {
+            0: "multiply",  # ones
+            1: "multiply",  # tens
+            2: "multiply",  # hundreds
+            3: "output ones digit",
+            4: "output tens digit",
+            5: "output hundreds digits"
+        }
+
+        # 每一步应该包含的具体被乘数（从 A 中提取）
+        expected_digits = {
+            0: str(env.A % 10),  # ones
+            1: str((env.A // 10) % 10),  # tens
+            2: str(env.A // 100)  # hundreds
+        }
+
         for action_index in range(env.num_actions):
             action_tensor = torch.zeros(env.num_actions)
             action_tensor[action_index] = 1.0
             input_tensor = torch.cat([state, action_tensor])
 
             action_text = env.allowed_actions[action_index]
-            # 完全禁止重复动作
-            if action_text in env.chain:
+
+            # 类型不符，直接跳过
+            if not action_text.startswith(step_requirements.get(step_index, "")):
+                score = torch.tensor([-9999.0])
+            # 前三步必须乘对位置的数字（0,1,2 -> ones, tens, hundreds）
+            elif step_index in expected_digits and expected_digits[step_index] not in action_text:
+                score = torch.tensor([-9999.0])
+            # 限制同一动作重复使用超过2次
+            elif env.chain.count(action_text) >= 2:
                 score = torch.tensor([-9999.0])
             else:
                 score = self.policy_net(input_tensor)
